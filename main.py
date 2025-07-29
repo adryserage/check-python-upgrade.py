@@ -196,10 +196,7 @@ class DependencyResolver:
         packages = self.parse_requirements()
 
         # Packages to potentially remove (usually auto-installed as dependencies)
-        removable_packages = {
-            "langchain-core",  # Let langchain install the right version
-            "google-ai-generativelanguage",  # Let google-generativeai handle this
-        }
+        removable_packages = {}
 
         updated_lines = []
         removed_packages = []
