@@ -1,260 +1,319 @@
+#!/usr/bin/env python3
 """
-This script checks the compatibility of Python packages listed in a requirements.txt file with a
-specified version of Python. It queries the PyPI API to fetch the latest versions of the packages,
-their release dates, and the minimum required versions that are compatible with the given Python version.
-
-The script can output the results in either Markdown format printed to stdout or CSV format written
-to a specified file. It accepts a requirements.txt file generated via pip-compile that includes
-package versions and hashes.
-
-Usage:
-    python check-python-upgrade.py requirements.txt [-o OUTPUT_FILE] [-t TARGET_PYTHON_VERSION]
-
-Arguments:
-    requirements_file (str): The path to the requirements.txt file to be processed.
-
-Optional Arguments:
-    -o, --output (str): The output file path where the report will be saved. If a file extension
-    is provided, it determines the format (.csv for CSV output, any other for Markdown). If omitted,
-    the script prints the Markdown report to stdout.
-    -t, --target-python-version (str): The Python version to check package compatibility against (defaults to '3.12').
-
-The report includes the following information for each package:
-- Current installed version
-- Latest available version
-- Release date of the latest version
-- Minimum version compatible with the target Python version
-- A flag indicating if an update is required to be compatible with the target Python version
-
-If the current package version is not compatible with the specified version of Python, the script marks it in the report, suggesting that an update is required.
-
-Please note that an internet connection is required to fetch the latest package information from the PyPI API.
-
-Example:
-    To check against Python 3.12 and output the report in CSV format to 'compatibility_report.csv':
-    python check-python-upgrade.py requirements.txt -o compatibility_report.csv
-
-    To print the report to stdout in Markdown format:
-    python check-python-upgrade.py requirements.txt
-
-Credits: Taken and modified/updated from https://gist.githubusercontent.com/mgaitan/5bc6d834465e1ab68ed5880a27e4ace4/raw/9d3d96d06b5ea81709f292c912aa1db74b7163b6/check-python-upgrade.py
-
+Enhanced Python Package Dependency Resolver
+Analyzes requirements.txt and automatically fixes dependency conflicts.
 """
 
 import argparse
-import csv
-import os
-from datetime import datetime
-from packaging.version import parse
-from packaging.specifiers import SpecifierSet
+import subprocess
+import sys
+import shutil
+import json
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-import requests
 
+class DependencyResolver:
+    def __init__(self, requirements_file: str):
+        self.requirements_file = Path(requirements_file)
+        self.backup_file = None
+        self.conflicts_found = []
+        self.fixes_applied = []
 
-def get_pypi_package_info(package_name: str, current_version, target_python_version):
-    url = f"https://pypi.org/pypi/{package_name.strip()}/json"
-    response = requests.get(url)
-    if response.status_code == 200:
-        try:
-            data = response.json()
-        except requests.exceptions.JSONDecodeError:
-            print(
-                f"Error Requesting Package {package_name} - Code: {response.status_code}"
-            )
-            print(url)
-            return "Unknown", "Unknown Date", "Unknown", "Unknown"
-        # Get the latest version
-        latest_version = data["info"]["version"]
-        # Get the release date of the latest version
-        latest_release_date = data["releases"][latest_version][0]["upload_time"]
-        # To find the minimum version that is compatible with Python 3.12, you would need to iterate
-        # over the releases and check which one specifies that it is compatible.
-        compatible_releases = {
-            version: release
-            for version, release in data["releases"].items()
-            for release_info in release
-            if release_info.get("requires_python")
-            and target_python_version in SpecifierSet(release_info["requires_python"])
+        # Known working version combinations
+        self.known_combinations = {
+            # LangChain ecosystem - compatible versions
+            "langchain_ecosystem": {
+                "google-generativeai": "0.7.2",
+                "langchain": "0.2.16",
+                "langchain-community": "0.2.16",
+                "langchain-google-genai": "1.0.10",
+                # Don't pin langchain-core, let it resolve automatically
+            },
+            # Django ecosystem
+            "django_ecosystem": {
+                "django": "5.1.4",  # Stable version
+                "djangorestframework": "3.15.2",
+                "django-cors-headers": "4.4.0",
+                "django-redis": "5.4.0",
+            },
+            # FastAPI ecosystem
+            "fastapi_ecosystem": {
+                "fastapi": "0.115.4",
+                "uvicorn[standard]": "0.32.0",
+                "pydantic": "2.10.3",  # Stable version, not alpha
+            },
         }
-        min_version = (
-            min(compatible_releases, key=parse) if compatible_releases else "Unknown"
-        )
-        try:
-            requires_python = data["releases"][current_version][0].get(
-                "requires_python"
-            )
-            if requires_python:
-                requires_update = target_python_version not in SpecifierSet(
-                    requires_python
-                )
-            else:
-                requires_update = "Unknown"
-        except (AttributeError, KeyError, IndexError):
-            requires_update = "Unknown"
 
-        return latest_version, latest_release_date, min_version, requires_update
-    else:
-        return "Unknown", "Unknown Date", "Unknown", "Unknown"
+    def create_backup(self):
+        """Create a backup of the original requirements file"""
+        self.backup_file = f"{self.requirements_file}.backup"
+        shutil.copy2(self.requirements_file, self.backup_file)
+        print(f"📁 Created backup: {self.backup_file}")
 
+    def parse_requirements(self) -> List[Tuple[str, str, str]]:
+        """Parse requirements.txt and return list of (package, version, original_line)"""
+        packages = []
 
-# Function to process the requirements.txt file and get the information
-def process_requirements(file_path, target_python_version):
-    with open(file_path) as file:
-        lines = file.readlines()
+        with open(self.requirements_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
 
-    requirements_info = []
+        for line_num, line in enumerate(lines, 1):
+            original_line = line.strip()
 
-    for line in lines:
-        if "==" in line:
-            package_name, current_version = line.strip("\\\n ").split("==")
-
-            if package_name.startswith("#"):
+            # Skip comments and empty lines
+            if not line.strip() or line.strip().startswith("#"):
+                packages.append((None, None, original_line))
                 continue
 
-            if "[" in package_name:
-                package_name = package_name.split("[")[0]
+            # Parse package==version format
+            if "==" in line:
+                try:
+                    package_part, version = line.strip().split("==", 1)
+                    # Handle extras like package[extra]==version
+                    package_name = package_part.split("[")[0].strip()
+                    packages.append((package_name, version.strip(), original_line))
+                except ValueError:
+                    packages.append((None, None, original_line))
+            else:
+                packages.append((None, None, original_line))
 
-            latest_version, latest_release_date, min_version, requires_update = (
-                get_pypi_package_info(
-                    package_name, current_version, target_python_version
-                )
-            )
-            # We do not have a direct way to get the minimum compatible version with Python 3.12 without internet access
-            requirements_info.append(
-                {
-                    "package": package_name,
-                    "current_version": current_version,
-                    "latest_version": latest_version,
-                    "latest_release_date": latest_release_date,
-                    "python_target_min_version": min_version,
-                    "requires_update": requires_update,
-                }
-            )
+        return packages
 
-    return requirements_info
+    def check_for_conflicts(self) -> bool:
+        """Check if current requirements have conflicts"""
+        print("🔍 Checking for dependency conflicts...")
 
-
-def generate_markdown_report(requirements_info, target_python_version, file=None):
-    headers = [
-        "Package",
-        "Current Version",
-        "Latest Version",
-        "Latest Release Date",
-        f"Min Version for Python {target_python_version}",
-        "Requires Update",
-    ]
-    rows = []
-    for req_info in requirements_info:
-        rows.append(
-            [
-                req_info["package"],
-                req_info["current_version"],
-                req_info["latest_version"],
-                req_info["latest_release_date"],
-                req_info["python_target_min_version"],
-                req_info["requires_update"],
-            ]
-        )
-
-    sort_order = {"True": 0, "Unknown": 1, "False": 3}
-
-    rows = sorted(rows, key=lambda x: sort_order.get(x[5], 2))
-
-    # Determine the maximum width for each column
-    column_widths = [max(len(str(row[i])) for row in rows) for i in range(len(headers))]
-    # Create the header row
-    header_row = " | ".join(
-        header.ljust(column_widths[i]) for i, header in enumerate(headers)
-    )
-    # Create the separator row
-    separator_row = " | ".join("-" * column_widths[i] for i, _ in enumerate(headers))
-    # Create the data rows
-    data_rows = [
-        " | ".join(str(row[i]).ljust(column_widths[i]) for i in range(len(headers)))
-        for row in rows
-    ]
-
-    # Add Title and Small Summary
-
-    markdown_header = f"# Compatability Report for Python {target_python_version} \n\n"
-
-    now = datetime.now()
-    markdown_header += f"This Report was Generated on the {now.strftime('%A, %d %B %Y, %I:%M %p')} \n\n"
-
-    # Combine all rows into a single string
-    markdown_output = markdown_header + "\n".join(
-        [header_row, separator_row, *data_rows]
-    )
-
-    # Print to stdout or write to a file
-    if file:
-        with open(file, "w") as f:
-            f.write(markdown_output)
-    else:
-        print(markdown_output)
-
-
-def generate_csv_report(requirements_info, target_python_version, filename):
-    fieldnames = [
-        "Package",
-        "Current Version",
-        "Latest Version",
-        "Latest Release Date",
-        f"Min Version for Python {target_python_version}",
-        "Requires Update",
-    ]
-
-    with open(filename, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for req_info in requirements_info:
-            row = {
-                "Package": req_info["package"],
-                "Current Version": req_info["current_version"],
-                "Latest Version": req_info["latest_version"],
-                "Latest Release Date": req_info["latest_release_date"],
-                f"Min Version for Python {target_python_version}": req_info[
-                    "python_target_min_version"
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--dry-run",
+                    "-r",
+                    str(self.requirements_file),
                 ],
-                "Requires Update": req_info["requires_update"],
-            }
-            writer.writerow(row)
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
 
+            if result.returncode == 0:
+                print("✅ No conflicts detected!")
+                return False
+            else:
+                print("❌ Conflicts detected!")
+                self.parse_conflict_output(result.stderr)
+                return True
 
-# Set up the argument parser
-parser = argparse.ArgumentParser(
-    description="Check package compatibility with a specified version of Python."
-)
-parser.add_argument(
-    "requirements_file", type=str, help="Path to the requirements.txt file."
-)
-parser.add_argument(
-    "-o",
-    "--output",
-    type=str,
-    help="Output file name. Format is determined by file extension (.csv for CSV, otherwise Markdown).",
-)
-parser.add_argument(
-    "-t",
-    "--target-python-version",
-    type=str,
-    default="3.12",
-    help='Target Python version for compatibility check. Default is "3.12".',
-)
+        except subprocess.TimeoutExpired:
+            print("⏰ Timeout checking dependencies")
+            return True
+        except Exception as e:
+            print(f"❌ Error checking dependencies: {e}")
+            return True
 
-args = parser.parse_args()
+    def parse_conflict_output(self, error_output: str):
+        """Parse pip error output to identify specific conflicts"""
+        lines = error_output.split("\n")
+        current_conflict = {}
 
-# Process the requirements file
-requirements_info = process_requirements(
-    args.requirements_file, args.target_python_version
-)
-if args.output:
-    file_ext = os.path.splitext(args.output)[-1]
-    if file_ext.lower() == ".csv":
-        generate_csv_report(requirements_info, args.target_python_version, args.output)
-    else:
-        generate_markdown_report(
-            requirements_info, args.target_python_version, args.output
+        for line in lines:
+            if "conflict" in line.lower() or "cannot install" in line.lower():
+                # Extract package names from conflict messages
+                packages = re.findall(r"([a-zA-Z0-9_-]+)==?([0-9.a-zA-Z]+)", line)
+                if packages:
+                    self.conflicts_found.extend(packages)
+
+        print(
+            f"🔍 Found conflicts involving: {', '.join(set(p[0] for p in self.conflicts_found))}"
         )
-else:
-    generate_markdown_report(requirements_info, args.target_python_version)
+
+    def apply_smart_fixes(self) -> bool:
+        """Apply intelligent fixes based on known working combinations"""
+        packages = self.parse_requirements()
+        package_dict = {pkg: (ver, line) for pkg, ver, line in packages if pkg}
+
+        fixes_needed = False
+        updated_lines = []
+
+        # Check each ecosystem for conflicts and apply fixes
+        for ecosystem_name, versions in self.known_combinations.items():
+            ecosystem_packages = set(versions.keys()) & set(package_dict.keys())
+
+            if len(ecosystem_packages) > 1:  # Multiple packages from same ecosystem
+                print(f"\n🔧 Applying {ecosystem_name} fixes...")
+
+                for pkg_name, target_version in versions.items():
+                    if pkg_name in package_dict:
+                        current_version = package_dict[pkg_name][0]
+                        if current_version != target_version:
+                            self.fixes_applied.append(
+                                f"{pkg_name}: {current_version} → {target_version}"
+                            )
+                            fixes_needed = True
+
+        # Rebuild requirements with fixes
+        for pkg, ver, original_line in packages:
+            if pkg is None:  # Comment or empty line
+                updated_lines.append(original_line)
+            else:
+                # Check if this package needs fixing
+                fixed_version = None
+                for ecosystem_versions in self.known_combinations.values():
+                    if pkg in ecosystem_versions:
+                        fixed_version = ecosystem_versions[pkg]
+                        break
+
+                if fixed_version and fixed_version != ver:
+                    # Apply fix
+                    if "[" in original_line:
+                        # Handle extras like uvicorn[standard]==version
+                        base_pkg, rest = original_line.split("==", 1)
+                        updated_lines.append(f"{base_pkg}=={fixed_version}")
+                    else:
+                        updated_lines.append(f"{pkg}=={fixed_version}")
+                else:
+                    updated_lines.append(original_line)
+
+        if fixes_needed:
+            # Write updated requirements
+            with open(self.requirements_file, "w", encoding="utf-8") as f:
+                for line in updated_lines:
+                    f.write(line + "\n" if not line.endswith("\n") else line)
+
+            print(f"\n✅ Applied {len(self.fixes_applied)} fixes:")
+            for fix in self.fixes_applied:
+                print(f"  - {fix}")
+
+        return fixes_needed
+
+    def remove_problematic_packages(self) -> bool:
+        """Remove packages that are causing unresolvable conflicts"""
+        packages = self.parse_requirements()
+
+        # Packages to potentially remove (usually auto-installed as dependencies)
+        removable_packages = {
+            "langchain-core",  # Let langchain install the right version
+            "google-ai-generativelanguage",  # Let google-generativeai handle this
+        }
+
+        updated_lines = []
+        removed_packages = []
+
+        for pkg, ver, original_line in packages:
+            if pkg in removable_packages:
+                removed_packages.append(pkg)
+                print(f"🗑️  Removing {pkg} (will be installed as dependency)")
+                continue
+            else:
+                updated_lines.append(original_line)
+
+        if removed_packages:
+            with open(self.requirements_file, "w", encoding="utf-8") as f:
+                for line in updated_lines:
+                    f.write(line + "\n" if not line.endswith("\n") else line)
+            return True
+
+        return False
+
+    def test_final_result(self) -> bool:
+        """Test if the final requirements can be installed"""
+        print("\n🧪 Testing final configuration...")
+
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--dry-run",
+                    "-r",
+                    str(self.requirements_file),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode == 0:
+                print(
+                    "✅ Success! Requirements can now be installed without conflicts."
+                )
+                return True
+            else:
+                print("❌ Still has some conflicts:")
+                # Show only critical errors
+                for line in result.stderr.split("\n"):
+                    if "ERROR:" in line or "conflict" in line.lower():
+                        print(f"  {line}")
+                return False
+
+        except Exception as e:
+            print(f"❌ Error testing final result: {e}")
+            return False
+
+    def resolve(self) -> bool:
+        """Main resolution process"""
+        print(f"🔧 Dependency Resolver for {self.requirements_file.name}")
+        print("=" * 60)
+
+        # Step 1: Check for conflicts
+        if not self.check_for_conflicts():
+            print("🎉 No conflicts found! Your requirements are already compatible.")
+            return True
+
+        # Step 2: Create backup
+        self.create_backup()
+
+        # Step 3: Remove problematic packages first
+        print("\n🗑️  Removing auto-managed packages...")
+        self.remove_problematic_packages()
+
+        # Step 4: Apply smart fixes
+        print("\n🔧 Applying compatibility fixes...")
+        self.apply_smart_fixes()
+
+        # Step 5: Test result
+        success = self.test_final_result()
+
+        if success:
+            print(f"\n🎉 Resolution complete! Backup saved as: {self.backup_file}")
+        else:
+            print(f"\n⚠️  Partial success. Some manual intervention may be needed.")
+            print(f"💾 Backup available at: {self.backup_file}")
+
+        return success
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Resolve Python package dependency conflicts"
+    )
+    parser.add_argument("requirements_file", help="Path to requirements.txt file")
+    parser.add_argument(
+        "--test-only", action="store_true", help="Only test for conflicts"
+    )
+
+    args = parser.parse_args()
+
+    if not Path(args.requirements_file).exists():
+        print(f"❌ File not found: {args.requirements_file}")
+        sys.exit(1)
+
+    resolver = DependencyResolver(args.requirements_file)
+
+    if args.test_only:
+        has_conflicts = resolver.check_for_conflicts()
+        sys.exit(1 if has_conflicts else 0)
+    else:
+        success = resolver.resolve()
+        sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
