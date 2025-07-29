@@ -13,4 +13,4 @@ A script to check the compatibility of Python packages in a `requirements.txt` f
 ## Usage
 
 ```bash
-python check-python-upgrade.py requirements.txt [-o OUTPUT_FILE] [-t TARGET_PYTHON_VERSION]
+python main.py requirements.txt
